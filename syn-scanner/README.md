@@ -3,7 +3,7 @@
 > Scapy로 TCP SYN 스캔을 직접 구현하며 nmap의 동작 원리를 이해하고,
 > 멀티스레딩 적용 과정에서 마주친 기술적 한계를 분석한 프로젝트.
 
-[English](./README.md) | 한국어
+[English](./README.en.md) | 한국어
 
 ---
 

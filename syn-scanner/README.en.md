@@ -3,7 +3,7 @@
 > A TCP SYN scanner built with Scapy to understand how nmap works under the hood —
 > and to analyze the technical limits encountered while adding multithreading.
 
-English | [한국어](./README.ko.md)
+English | [한국어](./README.md)
 
 ---
 

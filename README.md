@@ -9,6 +9,7 @@
 | 프로젝트 | 설명 | 기술 |
 |---------|------|------|
 | [syn-scanner](./syn-scanner) | TCP SYN 스캔 기반 포트 스캐너 | Python, Scapy |
+| [socket-scanner](./socket-scanner) | TCP Connect 스캔 + 배너 그래빙 포트 스캐너 | Python |
 
 ## 라이선스
 

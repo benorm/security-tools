@@ -10,10 +10,28 @@ import time
 
 
 SERVICE_NAMES = {
-    21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS",
-    80: "HTTP", 110: "POP3", 143: "IMAP", 443: "HTTPS",
-    3306: "MySQL", 3389: "RDP", 8080: "HTTP-Proxy",
+    "tcp": {
+        21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS",
+        80: "HTTP", 110: "POP3", 143: "IMAP", 443: "HTTPS",
+        3306: "MySQL", 3389: "RDP", 8080: "HTTP-Proxy",
+    },
+    "udp": {
+        53: "DNS", 67: "DHCP-Server", 68: "DHCP-Client", 69: "TFTP",
+        123: "NTP", 137: "NetBIOS-NS", 161: "SNMP", 500: "IKE",
+        514: "Syslog", 1900: "SSDP", 5353: "mDNS",
+    },
 }
+
+# UDP 프로토콜별 프로브: 서비스가 "이해하는" 데이터를 보내야 응답이 온다
+UDP_PROBES = {
+    # DNS: example.com A 레코드 질의
+    53: (b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+         b"\x07example\x03com\x00\x00\x01\x00\x01"),
+    # NTP: v3 클라이언트 요청 (첫 바이트 0x1b + 47바이트 0)
+    123: b"\x1b" + b"\x00" * 47,
+}
+
+DEFAULT_UDP_PORTS = "53,67,68,69,123,137,161,500,514,1900,5353"
 
 
 # ── ICMP ────────────────────────────────────────────────
@@ -66,6 +84,12 @@ def arp_scan(network, iface=None, timeout=2, **kwargs):
 
 # ── TCP ─────────────────────────────────────────────────
 
+def clean_banner(data):
+    """수신 데이터에서 출력 가능한 문자만 남긴다"""
+    text = data.decode(errors="ignore")
+    return "".join(c for c in text if c.isprintable()).strip() or None
+
+
 def tcp_probe(ip, port, timeout=1):
     """TCP connect로 포트 하나를 검사하고, 열려 있으면 배너를 수집한다.
 
@@ -85,9 +109,7 @@ def tcp_probe(ip, port, timeout=1):
 
         banner = None
         try:
-            data = s.recv(1024)
-            text = data.decode(errors="ignore")
-            banner = "".join(c for c in text if c.isprintable()).strip() or None
+            banner = clean_banner(s.recv(1024))
         except OSError:
             pass    # 배너가 없어도 열림 판정에는 영향 없음
         return ip, port, "OPEN", banner
@@ -95,16 +117,47 @@ def tcp_probe(ip, port, timeout=1):
         s.close()
 
 
-def tcp_scan(hosts, ports, max_workers=100):
-    """발견된 호스트들의 포트를 TCP Connect로 스캔 (4계층, 멀티스레딩).
+# ── UDP ─────────────────────────────────────────────────
 
-    connect()는 블로킹이므로 스레드 풀로 병렬화한다.
+def udp_probe(ip, port, timeout=2):
+    """UDP 데이터그램을 보내 포트 상태를 추정한다.
+
+    UDP 소켓에 connect()를 하면 커널이 해당 상대의 ICMP 오류를
+    이 소켓의 예외로 전달한다. 이를 이용해 root 없이 판정한다.
+      UDP 응답 수신            → OPEN
+      ConnectionRefusedError   → CLOSED        (ICMP Port Unreachable)
+      timeout                  → OPEN|FILTERED (열린 포트도, 방화벽도 무응답)
+      그 외 OSError            → FILTERED      (호스트 차단 등 다른 ICMP 오류)
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((ip, port))
+        s.send(UDP_PROBES.get(port, b""))
+        data = s.recv(1024)
+        return ip, port, "OPEN", clean_banner(data)
+    except ConnectionRefusedError:
+        return ip, port, "CLOSED", None
+    except socket.timeout:
+        return ip, port, "OPEN|FILTERED", None
+    except OSError:
+        return ip, port, "FILTERED", None
+    finally:
+        s.close()
+
+
+# ── 포트 스캔 공통 ──────────────────────────────────────
+
+def port_scan(probe, hosts, ports, max_workers):
+    """발견된 호스트들의 포트를 지정한 probe 함수로 스캔 (멀티스레딩).
+
+    connect()/recv()는 블로킹이므로 스레드 풀로 병렬화한다.
     스레드마다 독립된 커널 소켓을 쓰므로 Scapy와 달리 thread-safe하다.
     (호스트 × 포트) 조합 전체를 하나의 풀에 넣어 처리한다.
     """
     results = {h["ip"]: [] for h in hosts}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(tcp_probe, h["ip"], p)
+        futures = [executor.submit(probe, h["ip"], p)
                    for h in hosts for p in ports]
         for future in as_completed(futures):
             ip, port, state, banner = future.result()
@@ -154,19 +207,22 @@ def print_report(label, hosts, elapsed):
         print(f"    {h['ip']:<16} {mac}")
 
 
-def print_tcp_report(results, elapsed):
-    print(f"\n[+] TCP 포트 스캔 결과 ({elapsed:.1f}초)")
+def print_port_report(proto, results, elapsed):
+    print(f"\n[+] {proto.upper()} 포트 스캔 결과 ({elapsed:.1f}초)")
+    names = SERVICE_NAMES[proto]
     for ip in sorted(results, key=lambda x: int(x.split(".")[-1])):
         entries = sorted(results[ip])
-        open_ports = [e for e in entries if e[1] == "OPEN"]
-        closed = sum(1 for e in entries if e[1] == "CLOSED")
-        filtered = sum(1 for e in entries if e[1] == "FILTERED")
 
-        print(f"\n    [{ip}]  OPEN {len(open_ports)} / "
-              f"CLOSED {closed} / FILTERED {filtered}")
-        for port, state, banner in open_ports:
-            service = SERVICE_NAMES.get(port, "unknown")
-            line = f"      {port:>5}/tcp  {service:<11}"
+        counts = {}
+        for _, state, _ in entries:
+            counts[state] = counts.get(state, 0) + 1
+        summary = " / ".join(f"{st} {n}" for st, n in counts.items())
+        print(f"\n    [{ip}]  {summary}")
+
+        for port, state, banner in entries:
+            if state != "OPEN":
+                continue
+            line = f"      {port:>5}/{proto}  {names.get(port, 'unknown'):<11}"
             if banner:
                 line += f" {banner[:60]}"
             print(line)
@@ -182,14 +238,20 @@ def main():
                         help="ARP 호스트 발견 (로컬 세그먼트 전용)")
     parser.add_argument("--tcp", action="store_true",
                         help="발견된 호스트에 TCP Connect 포트 스캔")
+    parser.add_argument("--udp", action="store_true",
+                        help="발견된 호스트에 UDP 포트 스캔")
     parser.add_argument("-p", "--ports", default="1-1000",
-                        help="TCP 스캔 포트 (예: 1-1000, 22,80,443). 기본값: 1-1000")
+                        help="TCP 스캔 포트. 기본값: 1-1000")
+    parser.add_argument("-u", "--udp-ports", default=DEFAULT_UDP_PORTS,
+                        help=f"UDP 스캔 포트. 기본값: {DEFAULT_UDP_PORTS}")
     parser.add_argument("-i", "--iface",
                         help="송신 인터페이스. ARP 스캔에 필요")
     parser.add_argument("-w", "--workers", type=int, default=50,
                         help="ICMP 동시 작업자 수. 기본값: 50")
     parser.add_argument("--tcp-workers", type=int, default=100,
                         help="TCP 동시 작업자 수. 기본값: 100")
+    parser.add_argument("--udp-workers", type=int, default=20,
+                        help="UDP 동시 작업자 수. 기본값: 20")
     parser.add_argument("-t", "--timeout", type=int, default=2,
                         help="ARP 응답 대기 시간(초). 기본값: 2")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -229,16 +291,26 @@ def main():
         found.append(hosts)
 
     # 2단계: 포트 스캔
+    port_jobs = []
     if args.tcp:
-        targets = sort_hosts(merge_hosts(*found))
-        if not targets:
-            print("\n[!] 발견된 호스트가 없어 TCP 스캔을 건너뜁니다.")
-            return
-        ports = parse_ports(args.ports)
-        print(f"\n[*] TCP 스캔 중... (호스트 {len(targets)}대 × 포트 {len(ports)}개)")
+        port_jobs.append(("tcp", tcp_probe, args.ports, args.tcp_workers))
+    if args.udp:
+        port_jobs.append(("udp", udp_probe, args.udp_ports, args.udp_workers))
+    if not port_jobs:
+        return
+
+    targets = sort_hosts(merge_hosts(*found))
+    if not targets:
+        print("\n[!] 발견된 호스트가 없어 포트 스캔을 건너뜁니다.")
+        return
+
+    for proto, probe, ports_str, workers in port_jobs:
+        ports = parse_ports(ports_str)
+        print(f"\n[*] {proto.upper()} 스캔 중... "
+              f"(호스트 {len(targets)}대 × 포트 {len(ports)}개)")
         start = time.time()
-        results = tcp_scan(targets, ports, max_workers=args.tcp_workers)
-        print_tcp_report(results, time.time() - start)
+        results = port_scan(probe, targets, ports, workers)
+        print_port_report(proto, results, time.time() - start)
 
 
 if __name__ == "__main__":

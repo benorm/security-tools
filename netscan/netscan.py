@@ -5,6 +5,7 @@ from scapy.all import IP, ICMP, sr1, Ether, ARP, srp
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import argparse
 import errno
+import ipaddress
 import socket
 import time
 
@@ -36,26 +37,25 @@ DEFAULT_UDP_PORTS = "53,67,68,69,123,137,161,500,514,1900,5353"
 
 # ── ICMP ────────────────────────────────────────────────
 
-def ping_host(target):
+def ping_host(target, timeout=1):
     """한 호스트에 ICMP ping을 보내 살아있는지 확인"""
     packet = IP(dst=target)/ICMP()
-    response = sr1(packet, timeout=1, verbose=0)
+    response = sr1(packet, timeout=timeout, verbose=0)
     return target, (response is not None)
 
 
-def icmp_scan(network, max_workers=50, **kwargs):
+def icmp_scan(targets, max_workers=50, timeout=1, **kwargs):
     """ICMP 에코 요청으로 대역을 스캔 (3계층, 멀티스레딩).
 
     sr1()은 호출당 타겟 하나를 블로킹 처리하므로 스레드 풀로 병렬화한다.
     라우팅 테이블이 송신 인터페이스를 결정하므로 iface 지정이 불필요하다.
     로컬 세그먼트에서는 Scapy가 목적지 MAC을 얻기 위해 내부적으로 ARP를 먼저 수행한다.
     """
-    targets = [network + str(i) for i in range(1, 255)]
     alive = []
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_target = {
-            executor.submit(ping_host, t): t for t in targets
+            executor.submit(ping_host, t, timeout): t for t in targets
         }
         for future in as_completed(future_to_target):
             target, is_alive = future.result()
@@ -67,7 +67,7 @@ def icmp_scan(network, max_workers=50, **kwargs):
 
 # ── ARP ─────────────────────────────────────────────────
 
-def arp_scan(network, iface=None, timeout=2, **kwargs):
+def arp_scan(targets, iface=None, timeout=2, **kwargs):
     """ARP 요청으로 로컬 세그먼트를 스캔 (2계층, 일괄 전송).
 
     srp()가 다중 타겟 송신과 응답 수집을 비동기로 처리하므로
@@ -76,7 +76,6 @@ def arp_scan(network, iface=None, timeout=2, **kwargs):
     주의: 2계층 전송은 라우팅을 거치지 않는다. iface를 생략하면
     패킷 내용과 무관하게 conf.iface로 나가 다른 세그먼트를 스캔하게 된다.
     """
-    targets = [network + str(i) for i in range(1, 255)]
     packet = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=targets)
     answered, _ = srp(packet, timeout=timeout, iface=iface, verbose=0)
     return [{"ip": rcv.psrc, "mac": rcv.hwsrc} for snd, rcv in answered]
@@ -148,7 +147,7 @@ def udp_probe(ip, port, timeout=2):
 
 # ── 포트 스캔 공통 ──────────────────────────────────────
 
-def port_scan(probe, hosts, ports, max_workers):
+def port_scan(probe, hosts, ports, max_workers, timeout):
     """발견된 호스트들의 포트를 지정한 probe 함수로 스캔 (멀티스레딩).
 
     connect()/recv()는 블로킹이므로 스레드 풀로 병렬화한다.
@@ -157,7 +156,7 @@ def port_scan(probe, hosts, ports, max_workers):
     """
     results = {h["ip"]: [] for h in hosts}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(probe, h["ip"], p)
+        futures = [executor.submit(probe, h["ip"], p, timeout)
                    for h in hosts for p in ports]
         for future in as_completed(futures):
             ip, port, state, banner = future.result()
@@ -166,15 +165,54 @@ def port_scan(probe, hosts, ports, max_workers):
 
 
 def parse_ports(ports_str):
-    """'1-1000', '22,80,443', '1-100,8080' 형태를 포트 리스트로 변환"""
-    ports = []
-    for part in ports_str.split(","):
-        if "-" in part:
-            start, end = part.split("-")
-            ports.extend(range(int(start), int(end) + 1))
-        else:
-            ports.append(int(part))
-    return ports
+    """'1-1000', '22,80,443', '1-100,8080' 형태를 포트 리스트로 변환.
+
+    argparse의 type으로 쓰므로 잘못된 값은 ArgumentTypeError로 알린다.
+    중복은 제거하고 오름차순으로 돌려준다.
+    """
+    ports = set()
+    try:
+        for part in ports_str.split(","):
+            if "-" in part:
+                start, end = (int(x) for x in part.split("-"))
+            else:
+                start = end = int(part)
+            if not 1 <= start <= end <= 65535:
+                raise ValueError
+            ports.update(range(start, end + 1))
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"잘못된 포트 지정: '{ports_str}' (예: 22,80 / 1-1000, 범위 1-65535)")
+    return sorted(ports)
+
+
+def parse_network(value):
+    """'192.168.0.0/24'(대역) 또는 '192.168.0.5'(단일 호스트)를 받는다.
+
+    ip_network()는 '/'가 없으면 /32로 해석하므로 두 형태를 같은 방식으로 다룬다.
+    strict=False: '192.168.0.5/24'처럼 호스트 비트가 섞여도 대역으로 바로잡는다.
+    """
+    try:
+        return ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"잘못된 대상: '{value}' (예: 192.168.0.0/24 또는 192.168.0.5)")
+
+
+def positive_int(value):
+    """1 이상의 정수만 허용 (작업자 수)"""
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"1 이상이어야 합니다: {value}")
+    return n
+
+
+def positive_float(value):
+    """0보다 큰 실수만 허용 (timeout, 초 단위)"""
+    x = float(value)
+    if x <= 0:
+        raise argparse.ArgumentTypeError(f"0보다 커야 합니다: {value}")
+    return x
 
 
 # ── 공통 ────────────────────────────────────────────────
@@ -186,8 +224,8 @@ DISCOVERY = {
 
 
 def sort_hosts(hosts):
-    """마지막 옥텟 기준 정렬"""
-    return sorted(hosts, key=lambda h: int(h["ip"].split(".")[-1]))
+    """IP 주소 순서로 정렬"""
+    return sorted(hosts, key=lambda h: ipaddress.ip_address(h["ip"]))
 
 
 def merge_hosts(*host_lists):
@@ -210,7 +248,7 @@ def print_report(label, hosts, elapsed):
 def print_port_report(proto, results, elapsed):
     print(f"\n[+] {proto.upper()} 포트 스캔 결과 ({elapsed:.1f}초)")
     names = SERVICE_NAMES[proto]
-    for ip in sorted(results, key=lambda x: int(x.split(".")[-1])):
+    for ip in sorted(results, key=ipaddress.ip_address):
         entries = sorted(results[ip])
 
         counts = {}
@@ -230,32 +268,42 @@ def print_port_report(proto, results, elapsed):
 
 def main():
     parser = argparse.ArgumentParser(description="네트워크 스캐너 (netscan)")
-    parser.add_argument("-n", "--network", required=True,
-                        help="스캔할 네트워크 앞 3옥텟 (예: 192.168.0.)")
-    parser.add_argument("--icmp", action="store_true",
-                        help="ICMP 호스트 발견")
-    parser.add_argument("--arp", action="store_true",
-                        help="ARP 호스트 발견 (로컬 세그먼트 전용)")
-    parser.add_argument("--tcp", action="store_true",
-                        help="발견된 호스트에 TCP Connect 포트 스캔")
-    parser.add_argument("--udp", action="store_true",
-                        help="발견된 호스트에 UDP 포트 스캔")
-    parser.add_argument("-p", "--ports", default="1-1000",
-                        help="TCP 스캔 포트. 기본값: 1-1000")
-    parser.add_argument("-u", "--udp-ports", default=DEFAULT_UDP_PORTS,
-                        help=f"UDP 스캔 포트. 기본값: {DEFAULT_UDP_PORTS}")
+    parser.add_argument("-n", "--network", required=True, type=parse_network,
+                        help="스캔 대상. 대역(192.168.0.0/24) 또는 "
+                             "단일 호스트(192.168.0.5)")
     parser.add_argument("-i", "--iface",
                         help="송신 인터페이스. ARP 스캔에 필요")
-    parser.add_argument("-w", "--workers", type=int, default=50,
-                        help="ICMP 동시 작업자 수. 기본값: 50")
-    parser.add_argument("--tcp-workers", type=int, default=100,
-                        help="TCP 동시 작업자 수. 기본값: 100")
-    parser.add_argument("--udp-workers", type=int, default=20,
-                        help="UDP 동시 작업자 수. 기본값: 20")
-    parser.add_argument("-t", "--timeout", type=int, default=2,
-                        help="ARP 응답 대기 시간(초). 기본값: 2")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Scapy 내부 경고 출력 (디버깅용)")
+
+    disc = parser.add_argument_group("1단계: 호스트 발견")
+    disc.add_argument("--icmp", action="store_true",
+                      help="ICMP 호스트 발견")
+    disc.add_argument("--arp", action="store_true",
+                      help="ARP 호스트 발견 (로컬 세그먼트 전용)")
+    disc.add_argument("-t", "--timeout", type=positive_float, default=2,
+                      help="ICMP·ARP 응답 대기 시간(초). 기본값: 2")
+    disc.add_argument("--icmp-workers", type=positive_int, default=50,
+                      help="ICMP 동시 작업자 수. 기본값: 50")
+
+    scan = parser.add_argument_group("2단계: 포트 스캔")
+    scan.add_argument("--tcp", action="store_true",
+                      help="발견된 호스트에 TCP Connect 포트 스캔")
+    scan.add_argument("--udp", action="store_true",
+                      help="발견된 호스트에 UDP 포트 스캔")
+    scan.add_argument("-p", "--ports", type=parse_ports, default="1-1000",
+                      help="TCP 스캔 포트. 기본값: 1-1000")
+    scan.add_argument("-u", "--udp-ports", type=parse_ports,
+                      default=DEFAULT_UDP_PORTS,
+                      help=f"UDP 스캔 포트. 기본값: {DEFAULT_UDP_PORTS}")
+    scan.add_argument("--tcp-workers", type=positive_int, default=100,
+                      help="TCP 동시 작업자 수. 기본값: 100")
+    scan.add_argument("--udp-workers", type=positive_int, default=20,
+                      help="UDP 동시 작업자 수. 기본값: 20")
+    scan.add_argument("--tcp-timeout", type=positive_float, default=1,
+                      help="TCP 포트당 응답 대기 시간(초). 기본값: 1")
+    scan.add_argument("--udp-timeout", type=positive_float, default=2,
+                      help="UDP 포트당 응답 대기 시간(초). 기본값: 2")
     args = parser.parse_args()
 
     if args.verbose:
@@ -270,7 +318,9 @@ def main():
         print("[!] 2계층 전송은 라우팅을 거치지 않으므로 기본 인터페이스로 "
               "나가 다른 세그먼트를 스캔할 수 있습니다.\n")
 
-    print(f"[*] {args.network}0/24 대역 스캔 시작")
+    # hosts(): 네트워크·브로드캐스트 주소 제외 (/24면 .1~.254, /32면 자기 자신)
+    candidates = [str(ip) for ip in args.network.hosts()]
+    print(f"[*] {args.network} 스캔 시작 (대상 {len(candidates)}개)")
 
     # 1단계: 호스트 발견
     found = []
@@ -279,8 +329,9 @@ def main():
         print(f"\n[*] {label} 스캔 중...")
         start = time.time()
         try:
-            hosts = scanner(args.network, iface=args.iface,
-                            max_workers=args.workers, timeout=args.timeout)
+            hosts = scanner(candidates, iface=args.iface,
+                            max_workers=args.icmp_workers,
+                            timeout=args.timeout)
         except PermissionError:
             print(f"[!] {label} 스캔에는 root 권한이 필요합니다 (sudo)")
             continue
@@ -293,9 +344,11 @@ def main():
     # 2단계: 포트 스캔
     port_jobs = []
     if args.tcp:
-        port_jobs.append(("tcp", tcp_probe, args.ports, args.tcp_workers))
+        port_jobs.append(("tcp", tcp_probe, args.ports,
+                          args.tcp_workers, args.tcp_timeout))
     if args.udp:
-        port_jobs.append(("udp", udp_probe, args.udp_ports, args.udp_workers))
+        port_jobs.append(("udp", udp_probe, args.udp_ports,
+                          args.udp_workers, args.udp_timeout))
     if not port_jobs:
         return
 
@@ -304,12 +357,11 @@ def main():
         print("\n[!] 발견된 호스트가 없어 포트 스캔을 건너뜁니다.")
         return
 
-    for proto, probe, ports_str, workers in port_jobs:
-        ports = parse_ports(ports_str)
+    for proto, probe, ports, workers, timeout in port_jobs:
         print(f"\n[*] {proto.upper()} 스캔 중... "
               f"(호스트 {len(targets)}대 × 포트 {len(ports)}개)")
         start = time.time()
-        results = port_scan(probe, targets, ports, workers)
+        results = port_scan(probe, targets, ports, workers, timeout)
         print_port_report(proto, results, time.time() - start)
 
 

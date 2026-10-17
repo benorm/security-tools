@@ -285,6 +285,9 @@ def main():
                       help="ICMP·ARP 응답 대기 시간(초). 기본값: 2")
     disc.add_argument("--icmp-workers", type=positive_int, default=50,
                       help="ICMP 동시 작업자 수. 기본값: 50")
+    disc.add_argument("-Pn", "--skip-discovery", action="store_true",
+                      help="호스트 발견을 건너뛰고 대상 전체를 포트 스캔. "
+                           "ICMP·ARP에 응답하지 않는 호스트용")
 
     scan = parser.add_argument_group("2단계: 포트 스캔")
     scan.add_argument("--tcp", action="store_true",
@@ -309,9 +312,24 @@ def main():
     if args.verbose:
         logging.getLogger("scapy.runtime").setLevel(logging.WARNING)
 
+    port_jobs = []
+    if args.tcp:
+        port_jobs.append(("tcp", tcp_probe, args.ports,
+                          args.tcp_workers, args.tcp_timeout))
+    if args.udp:
+        port_jobs.append(("udp", udp_probe, args.udp_ports,
+                          args.udp_workers, args.udp_timeout))
+
     selected = [k for k in DISCOVERY if getattr(args, k)]
-    if not selected:
-        parser.error("호스트 발견 방식을 하나 이상 지정하세요 (--icmp / --arp)")
+    if args.skip_discovery:
+        if selected:
+            parser.error("-Pn은 발견 단계를 건너뛰므로 --icmp / --arp와 "
+                         "함께 쓸 수 없습니다")
+        if not port_jobs:
+            parser.error("-Pn에는 포트 스캔 방식이 필요합니다 (--tcp / --udp)")
+    elif not selected:
+        parser.error("호스트 발견 방식을 하나 이상 지정하세요 "
+                     "(--icmp / --arp, 또는 -Pn)")
 
     if args.arp and not args.iface:
         print("[!] ARP 스캔에 --iface가 지정되지 않았습니다.")
@@ -341,14 +359,12 @@ def main():
         print_report(label, sort_hosts(hosts), time.time() - start)
         found.append(hosts)
 
+    # -Pn: 발견 결과 대신 후보 전체를 포트 스캔 대상으로 삼는다
+    if args.skip_discovery:
+        print("\n[*] 호스트 발견 생략 (-Pn): 대상 전체를 포트 스캔합니다")
+        found.append([{"ip": ip, "mac": None} for ip in candidates])
+
     # 2단계: 포트 스캔
-    port_jobs = []
-    if args.tcp:
-        port_jobs.append(("tcp", tcp_probe, args.ports,
-                          args.tcp_workers, args.tcp_timeout))
-    if args.udp:
-        port_jobs.append(("udp", udp_probe, args.udp_ports,
-                          args.udp_workers, args.udp_timeout))
     if not port_jobs:
         return
 

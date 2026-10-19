@@ -7,6 +7,7 @@ import argparse
 import errno
 import ipaddress
 import socket
+import threading
 import time
 
 
@@ -147,17 +148,49 @@ def udp_probe(ip, port, timeout=2):
 
 # ── 포트 스캔 공통 ──────────────────────────────────────
 
-def port_scan(probe, hosts, ports, max_workers, timeout):
+class HostPacer:
+    """호스트별 송신 간격을 지킨다 (UDP의 ICMP rate limit 대응).
+
+    리눅스는 상대 IP마다 ICMP 오류를 약 1초에 1개만 보낸다. 더 촘촘히 보내면
+    닫힌 포트의 ICMP Port Unreachable이 생략돼 OPEN|FILTERED로 잘못 판정된다.
+    워커는 보내기 전에 그 호스트의 다음 송신 시각을 예약하고 그때까지 잔다.
+    락은 예약하는 순간에만 잡으므로 다른 호스트로 가는 워커를 막지 않는다.
+    """
+
+    def __init__(self, delay):
+        self.delay = delay
+        self.next_send = {}
+        self.lock = threading.Lock()
+
+    def wait(self, ip):
+        with self.lock:
+            now = time.monotonic()
+            slot = max(now, self.next_send.get(ip, now))
+            self.next_send[ip] = slot + self.delay
+        time.sleep(slot - now)
+
+
+def port_scan(probe, hosts, ports, max_workers, timeout, delay):
     """발견된 호스트들의 포트를 지정한 probe 함수로 스캔 (멀티스레딩).
 
     connect()/recv()는 블로킹이므로 스레드 풀로 병렬화한다.
     스레드마다 독립된 커널 소켓을 쓰므로 Scapy와 달리 thread-safe하다.
     (호스트 × 포트) 조합 전체를 하나의 풀에 넣어 처리한다.
+    delay > 0이면 같은 호스트로의 송신 사이에 delay초 이상 간격을 둔다.
     """
+    pacer = HostPacer(delay) if delay else None
+
+    def job(ip, port):
+        if pacer:
+            pacer.wait(ip)
+        return probe(ip, port, timeout)
+
     results = {h["ip"]: [] for h in hosts}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(probe, h["ip"], p, timeout)
-                   for h in hosts for p in ports]
+        # 포트 우선 순서 (p1,h1) (p1,h2) ... (p2,h1): 동시에 도는 작업이
+        # 여러 호스트로 흩어져, 간격을 기다리며 자는 워커가 줄어든다
+        futures = [executor.submit(job, h["ip"], p)
+                   for p in ports for h in hosts]
         for future in as_completed(futures):
             ip, port, state, banner = future.result()
             results[ip].append((port, state, banner))
@@ -205,6 +238,14 @@ def positive_int(value):
     if n < 1:
         raise argparse.ArgumentTypeError(f"1 이상이어야 합니다: {value}")
     return n
+
+
+def non_negative_float(value):
+    """0 이상의 실수만 허용 (간격, 초 단위. 0 = 간격 없음)"""
+    x = float(value)
+    if x < 0:
+        raise argparse.ArgumentTypeError(f"0 이상이어야 합니다: {value}")
+    return x
 
 
 def positive_float(value):
@@ -307,6 +348,10 @@ def main():
                       help="TCP 포트당 응답 대기 시간(초). 기본값: 1")
     scan.add_argument("--udp-timeout", type=positive_float, default=2,
                       help="UDP 포트당 응답 대기 시간(초). 기본값: 2")
+    scan.add_argument("--udp-delay", type=non_negative_float, default=1,
+                      help="같은 호스트로 보내는 UDP 프로브 간격(초). "
+                           "ICMP rate limit으로 닫힌 포트를 놓치지 않게 함. "
+                           "0이면 간격 없음. 기본값: 1")
     args = parser.parse_args()
 
     if args.verbose:
@@ -315,10 +360,10 @@ def main():
     port_jobs = []
     if args.tcp:
         port_jobs.append(("tcp", tcp_probe, args.ports,
-                          args.tcp_workers, args.tcp_timeout))
+                          args.tcp_workers, args.tcp_timeout, 0))
     if args.udp:
         port_jobs.append(("udp", udp_probe, args.udp_ports,
-                          args.udp_workers, args.udp_timeout))
+                          args.udp_workers, args.udp_timeout, args.udp_delay))
 
     selected = [k for k in DISCOVERY if getattr(args, k)]
     if args.skip_discovery:
@@ -373,11 +418,11 @@ def main():
         print("\n[!] 발견된 호스트가 없어 포트 스캔을 건너뜁니다.")
         return
 
-    for proto, probe, ports, workers, timeout in port_jobs:
+    for proto, probe, ports, workers, timeout, delay in port_jobs:
         print(f"\n[*] {proto.upper()} 스캔 중... "
               f"(호스트 {len(targets)}대 × 포트 {len(ports)}개)")
         start = time.time()
-        results = port_scan(probe, targets, ports, workers, timeout)
+        results = port_scan(probe, targets, ports, workers, timeout, delay)
         print_port_report(proto, results, time.time() - start)
 
 

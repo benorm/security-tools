@@ -41,14 +41,14 @@ HTTP_PROBE = b"HEAD / HTTP/1.0\r\n\r\n"
 
 # ── ICMP ────────────────────────────────────────────────
 
-def ping_host(target, timeout=1):
+def ping_host(target, timeout):
     """한 호스트에 ICMP ping을 보내 살아있는지 확인"""
     packet = IP(dst=target)/ICMP()
     response = sr1(packet, timeout=timeout, verbose=0)
     return target, (response is not None)
 
 
-def icmp_scan(targets, max_workers=50, timeout=1, **kwargs):
+def icmp_scan(targets, max_workers, timeout, **kwargs):
     """ICMP 에코 요청으로 대역을 스캔 (3계층, 멀티스레딩).
 
     sr1()은 호출당 타겟 하나를 블로킹 처리하므로 스레드 풀로 병렬화한다.
@@ -71,7 +71,7 @@ def icmp_scan(targets, max_workers=50, timeout=1, **kwargs):
 
 # ── ARP ─────────────────────────────────────────────────
 
-def arp_scan(targets, iface=None, timeout=2, **kwargs):
+def arp_scan(targets, iface, timeout, **kwargs):
     """ARP 요청으로 로컬 세그먼트를 스캔 (2계층, 일괄 전송).
 
     srp()가 다중 타겟 송신과 응답 수집을 비동기로 처리하므로
@@ -145,7 +145,7 @@ def grab_banner(s):
     return clean_banner(data)
 
 
-def tcp_probe(ip, port, timeout=1):
+def tcp_probe(ip, port, timeout):
     """TCP connect로 포트 하나를 검사하고, 열려 있으면 배너를 수집한다.
 
     connect_ex() 반환값으로 세 상태를 구분한다.
@@ -174,7 +174,7 @@ def tcp_probe(ip, port, timeout=1):
 
 # ── UDP ─────────────────────────────────────────────────
 
-def udp_probe(ip, port, timeout=2):
+def udp_probe(ip, port, timeout):
     """UDP 데이터그램을 보내 포트 상태를 추정한다.
 
     UDP 소켓에 connect()를 하면 커널이 해당 상대의 ICMP 오류를
@@ -390,7 +390,8 @@ def main():
                       help="발견된 호스트에 TCP Connect 포트 스캔")
     scan.add_argument("--udp", action="store_true",
                       help="발견된 호스트에 UDP 포트 스캔")
-    scan.add_argument("-p", "--ports", type=parse_ports, default="1-1000",
+    scan.add_argument("-p", "--tcp-ports", "--ports", type=parse_ports,
+                      default="1-1000",
                       help="TCP 스캔 포트. 기본값: 1-1000")
     scan.add_argument("-u", "--udp-ports", type=parse_ports,
                       default=DEFAULT_UDP_PORTS,
@@ -414,7 +415,7 @@ def main():
 
     port_jobs = []
     if args.tcp:
-        port_jobs.append(("tcp", tcp_probe, args.ports,
+        port_jobs.append(("tcp", tcp_probe, args.tcp_ports,
                           args.tcp_workers, args.tcp_timeout, 0))
     if args.udp:
         port_jobs.append(("udp", udp_probe, args.udp_ports,

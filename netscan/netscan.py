@@ -93,6 +93,23 @@ def clean_banner(data):
     return "".join(c for c in text if c.isprintable()).strip() or None
 
 
+def mysql_version(data):
+    """MySQL 초기 핸드셰이크 패킷이면 서버 버전 문자열만 꺼낸다. 아니면 None.
+
+    패킷 구조: [길이 3B, little-endian][순번 1B][프로토콜 버전 1B = 10]
+              [서버 버전 문자열 ... \x00][연결 ID, salt 등 바이너리]
+    길이 필드가 실제 수신 길이와 맞는지까지 확인해 다른 바이너리 배너를 걸러낸다.
+    """
+    if len(data) < 6 or data[4] != 10:
+        return None
+    if int.from_bytes(data[:3], "little") != len(data) - 4:
+        return None
+    end = data.find(b"\x00", 5)
+    if end == -1:
+        return None
+    return "MySQL " + data[5:end].decode(errors="ignore")
+
+
 def http_server(data):
     """HTTP 응답에서 Server 헤더 값을 꺼낸다. 헤더가 없으면 상태 줄을 돌려준다.
 
@@ -117,7 +134,7 @@ def grab_banner(s):
         data = s.recv(1024)
         if not data:
             return None     # TCP의 b"" = 상대가 연결을 닫음
-        return clean_banner(data)
+        return mysql_version(data) or clean_banner(data)
     except socket.timeout:
         pass
 

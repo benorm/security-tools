@@ -35,6 +35,9 @@ UDP_PROBES = {
 
 DEFAULT_UDP_PORTS = "53,67,68,69,123,137,161,500,514,1900,5353"
 
+# 서버가 먼저 말하지 않는 TCP 포트에 보내는 요청. HEAD는 본문 없이 헤더만 받는다
+HTTP_PROBE = b"HEAD / HTTP/1.0\r\n\r\n"
+
 
 # ── ICMP ────────────────────────────────────────────────
 
@@ -90,6 +93,41 @@ def clean_banner(data):
     return "".join(c for c in text if c.isprintable()).strip() or None
 
 
+def http_server(data):
+    """HTTP 응답에서 Server 헤더 값을 꺼낸다. 헤더가 없으면 상태 줄을 돌려준다.
+
+    헤더 이름은 대소문자를 구분하지 않는다 (Server / server 모두 같은 헤더).
+    """
+    lines = data.decode(errors="ignore").split("\r\n")
+    for line in lines[1:]:
+        name, _, value = line.partition(":")
+        if name.strip().lower() == "server":
+            return value.strip() or None
+    return lines[0].strip() or None
+
+
+def grab_banner(s):
+    """서버가 먼저 보내는 배너를 기다리고, 없으면 HTTP 요청을 보내 본다.
+
+    SSH·FTP·MySQL은 연결 직후 서버가 먼저 말하지만 HTTP는 요청을 기다린다.
+    그래서 timeout 동안 기다려도 아무것도 안 오면 HTTP_PROBE를 보낸다.
+    포트 번호로 HTTP를 추정하지 않으므로 비표준 포트의 웹 서버도 식별된다.
+    """
+    try:
+        data = s.recv(1024)
+        if not data:
+            return None     # TCP의 b"" = 상대가 연결을 닫음
+        return clean_banner(data)
+    except socket.timeout:
+        pass
+
+    s.sendall(HTTP_PROBE)
+    data = s.recv(1024)
+    if data.startswith(b"HTTP/"):
+        return http_server(data)
+    return clean_banner(data)
+
+
 def tcp_probe(ip, port, timeout=1):
     """TCP connect로 포트 하나를 검사하고, 열려 있으면 배너를 수집한다.
 
@@ -109,7 +147,7 @@ def tcp_probe(ip, port, timeout=1):
 
         banner = None
         try:
-            banner = clean_banner(s.recv(1024))
+            banner = grab_banner(s)
         except OSError:
             pass    # 배너가 없어도 열림 판정에는 영향 없음
         return ip, port, "OPEN", banner

@@ -1,3 +1,15 @@
+"""netscan: 호스트 발견과 포트 스캔을 한 번에 하는 네트워크 스캐너.
+
+1단계 호스트 발견:  --icmp(3계층) / --arp(2계층), 또는 -Pn으로 건너뛰기
+2단계 포트 스캔:    --tcp(TCP Connect) / --udp(UDP + ICMP 오류 판정)
+                    열린 TCP 포트는 배너·HTTP Server 헤더·MySQL 버전을 수집
+
+예) sudo python3 netscan.py -n 192.168.0.0/24 -i eth1 --arp --tcp
+    python3 netscan.py -n 192.168.0.5 -Pn --udp -u 1-100
+
+ICMP·ARP 발견은 raw 소켓을 쓰므로 root가 필요하고, 포트 스캔은 커널 소켓을 쓰므로 필요 없다.
+"""
+
 import logging
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 
@@ -85,7 +97,7 @@ def arp_scan(targets, iface, timeout, **kwargs):
     return [{"ip": rcv.psrc, "mac": rcv.hwsrc} for snd, rcv in answered]
 
 
-# ── TCP ─────────────────────────────────────────────────
+# ── TCP (포트 상태 + 배너 수집) ─────────────────────────
 
 def clean_banner(data):
     """수신 데이터에서 출력 가능한 문자만 남긴다"""
@@ -152,6 +164,7 @@ def tcp_probe(ip, port, timeout):
       0            → OPEN     (SYN-ACK 수신, 연결 성립)
       ECONNREFUSED → CLOSED   (RST 수신, 호스트가 거부 응답)
       그 외        → FILTERED (무응답, 방화벽이 버린 것으로 추정)
+    배너 수집 방식은 grab_banner() 참고.
     """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
@@ -226,7 +239,7 @@ class HostPacer:
 
 
 def port_scan(probe, hosts, ports, max_workers, timeout, delay):
-    """발견된 호스트들의 포트를 지정한 probe 함수로 스캔 (멀티스레딩).
+    """대상 호스트들의 포트를 지정한 probe 함수로 스캔 (멀티스레딩).
 
     connect()/recv()는 블로킹이므로 스레드 풀로 병렬화한다.
     스레드마다 독립된 커널 소켓을 쓰므로 Scapy와 달리 thread-safe하다.
@@ -387,9 +400,9 @@ def main():
 
     scan = parser.add_argument_group("2단계: 포트 스캔")
     scan.add_argument("--tcp", action="store_true",
-                      help="발견된 호스트에 TCP Connect 포트 스캔")
+                      help="TCP Connect 포트 스캔 (root 불필요)")
     scan.add_argument("--udp", action="store_true",
-                      help="발견된 호스트에 UDP 포트 스캔")
+                      help="UDP 포트 스캔 (root 불필요)")
     scan.add_argument("-p", "--tcp-ports", "--ports", type=parse_ports,
                       default="1-1000",
                       help="TCP 스캔 포트. 기본값: 1-1000")

@@ -10,6 +10,7 @@
 |---------|------|------|
 | [syn-scanner](./syn-scanner) | TCP SYN 스캔 기반 포트 스캐너 | Python, Scapy |
 | [socket-scanner](./socket-scanner) | TCP Connect 스캔 + 배너 그래빙 포트 스캐너 | Python |
+| [netscan](./netscan) | 호스트 발견(ICMP·ARP) + TCP·UDP 포트 스캔 + 서비스 식별 | Python, Scapy |
 
 ## 라이선스
 

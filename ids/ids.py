@@ -3,15 +3,21 @@
 
 출발지 IP별로 최근 window초 동안 SYN을 보낸 목적지 포트를 기록하고,
 서로 다른 포트 수가 threshold 이상이면 TCP 포트 스캔으로 경보한다.
+--log를 주면 경보를 JSON Lines(한 줄 = 경보 하나)로도 기록한다.
 """
 import argparse
+import json
 import time
 from collections import defaultdict, deque
+from datetime import datetime
 
 from scapy.all import IP, TCP, sniff
 
 # SYN만 켜지고 ACK는 꺼진 패킷 = 연결 시작 요청 (SYN-ACK 응답은 제외)
 SYN_ONLY = "tcp[tcpflags] & (tcp-syn|tcp-ack) == tcp-syn"
+
+# 탐지 규칙 ID. Snort·Suricata 관례상 1000000 이상은 사용자 정의 규칙
+SID_TCP_PORT_SCAN = 1000001
 
 
 def positive_int(value):
@@ -58,38 +64,74 @@ class PortScanDetector:
         return ports
 
 
+def build_alert(now, src, dst, ports, window):
+    """경보 하나를 Suricata eve.json과 비슷한 필드 구조의 dict로"""
+    return {
+        "timestamp": datetime.fromtimestamp(now).astimezone().isoformat(timespec="milliseconds"),
+        "event_type": "alert",
+        "src_ip": src,
+        "dest_ip": dst,
+        "proto": "TCP",
+        "alert": {
+            "signature_id": SID_TCP_PORT_SCAN,
+            "signature": "TCP 포트 스캔 의심",
+            "category": "port-scan",
+        },
+        "scan": {"window": window, "port_count": len(ports), "ports": sorted(ports)},
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="네트워크 스캔 탐지기")
     parser.add_argument("-i", "--iface", required=True,
                         help="감시할 인터페이스")
     parser.add_argument("-f", "--filter", default=SYN_ONLY,
                         help="BPF 캡처 필터 (기본: SYN만)")
-    parser.add_argument("-w", "--window", type=positive_float, default=10,
+    parser.add_argument("-w", "--window", type=positive_float, default=10.0,
                         help="탐지 시간 창, 초 (기본: %(default)s)")
     parser.add_argument("-T", "--threshold", type=positive_int, default=15,
                         help="시간 창 안의 서로 다른 포트 수 기준 (기본: %(default)s)")
+    parser.add_argument("-l", "--log",
+                        help="경보를 JSON Lines로 덧붙여 기록할 파일")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="받은 SYN을 모두 출력")
     args = parser.parse_args()
+
+    log_file = None
+    if args.log:
+        try:
+            # buffering=1: 줄 단위로 바로 디스크에 씀 → tail -f·수집기가 즉시 읽음
+            log_file = open(args.log, "a", encoding="utf-8", buffering=1)
+        except OSError as e:
+            parser.error(f"로그 파일을 열 수 없습니다: {e}")
 
     detector = PortScanDetector(args.window, args.threshold)
 
     def handle(pkt):
         if IP not in pkt or TCP not in pkt:
             return
-        src, dport, now = pkt[IP].src, pkt[TCP].dport, float(pkt.time)
+        src, dst, dport, now = pkt[IP].src, pkt[IP].dst, pkt[TCP].dport, float(pkt.time)
         if args.verbose:
-            print(f"{fmt_time(now)} SYN {src}:{pkt[TCP].sport} > {pkt[IP].dst}:{dport}")
+            print(f"{fmt_time(now)} SYN {src}:{pkt[TCP].sport} > {dst}:{dport}")
 
         ports = detector.check(src, dport, now)
-        if ports:
-            listed = sorted(ports)
-            sample = ", ".join(map(str, listed[:10])) + (", ..." if len(listed) > 10 else "")
-            print(f"[!] {fmt_time(now)} TCP 포트 스캔 의심: {src} → "
-                  f"{args.window:g}초 안에 포트 {len(ports)}개 ({sample})")
+        if not ports:
+            return
+        listed = sorted(ports)
+        sample = ", ".join(map(str, listed[:10])) + (", ..." if len(listed) > 10 else "")
+        print(f"[!] {fmt_time(now)} TCP 포트 스캔 의심: {src} → "
+              f"{args.window:g}초 안에 포트 {len(ports)}개 ({sample})")
+        if log_file:
+            alert = build_alert(now, src, dst, ports, args.window)
+            log_file.write(json.dumps(alert, ensure_ascii=False) + "\n")
 
-    print(f"[*] {args.iface} 감시 시작 (창 {args.window:g}초, 기준 포트 {args.threshold}개), Ctrl+C로 종료")
-    sniff(iface=args.iface, filter=args.filter, store=False, prn=handle)
+    print(f"[*] {args.iface} 감시 시작 (창 {args.window:g}초, 기준 포트 {args.threshold}개"
+          f"{', 로그 ' + args.log if args.log else ''}), Ctrl+C로 종료")
+    try:
+        sniff(iface=args.iface, filter=args.filter, store=False, prn=handle)
+    finally:
+        if log_file:
+            log_file.close()
 
 
 if __name__ == "__main__":

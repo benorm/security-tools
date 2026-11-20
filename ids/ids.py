@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """ids - 네트워크 스캔 탐지기
 
-출발지 IP별로 최근 window초 동안 건드린 대상을 규칙마다 따로 기록하고,
-서로 다른 대상 수가 threshold 이상이면 경보한다.
+출발지 IP별로 시간 창 안에서 건드린 서로 다른 대상 수를 규칙마다 따로 세어 경보한다.
   - TCP SYN·UDP: 대상 = 목적지 포트 (포트 스캔)
   - ARP 요청:    대상 = 물어본 IP   (호스트 스윕)
+창은 두 가지를 동시에 쓴다.
+  - 빠른 스캔: 짧은 창(기본 10초 / 15개)
+  - 저속 스캔: 긴 창(기본 60초 / 20개). 빠른 스캔 경보가 난 출발지는 긴 창 동안 생략
 --log를 주면 경보를 JSON Lines(한 줄 = 경보 하나)로도 기록한다.
 """
 import argparse
@@ -23,13 +25,14 @@ DEFAULT_FILTER = f"({SYN_ONLY}) or udp or arp"
 # 탐지 규칙. Snort·Suricata 관례상 signature_id 1000000 이상은 사용자 정의 규칙
 # target: 로그의 scan 필드에서 대상 목록을 담을 이름
 RULES = {
-    "TCP": {"signature_id": 1000001, "signature": "TCP 포트 스캔 의심",
-            "category": "port-scan", "target": "ports"},
-    "UDP": {"signature_id": 1000002, "signature": "UDP 포트 스캔 의심",
-            "category": "port-scan", "target": "ports"},
-    "ARP": {"signature_id": 1000003, "signature": "ARP 스윕 의심",
-            "category": "host-sweep", "target": "hosts"},
+    "TCP": {"name": "TCP 포트 스캔", "category": "port-scan", "target": "ports",
+            "sid": {"fast": 1000001, "slow": 1000004}},
+    "UDP": {"name": "UDP 포트 스캔", "category": "port-scan", "target": "ports",
+            "sid": {"fast": 1000002, "slow": 1000005}},
+    "ARP": {"name": "ARP 스윕", "category": "host-sweep", "target": "hosts",
+            "sid": {"fast": 1000003, "slow": 1000006}},
 }
+SPEEDS = ("fast", "slow")  # 빠른 규칙을 먼저 검사해야 저속 생략 판단이 가능
 
 ARP_REQUEST = 1  # ARP op: 1 = who-has(요청), 2 = is-at(응답)
 
@@ -58,6 +61,11 @@ def sort_targets(targets):
     return sorted(targets, key=lambda t: ipaddress.ip_address(t) if isinstance(t, str) else t)
 
 
+def signature(proto, speed):
+    name = RULES[proto]["name"]
+    return f"{name} 의심" if speed == "fast" else f"저속 {name} 의심"
+
+
 class ScanDetector:
     """출발지별 시간 창 안에서 건드린 서로 다른 대상(포트·IP) 수로 스캔 판단"""
 
@@ -83,7 +91,7 @@ class ScanDetector:
         return targets
 
 
-def build_alert(now, proto, src, dst, targets, window):
+def build_alert(now, proto, speed, src, dst, targets, window):
     """경보 하나를 Suricata eve.json과 비슷한 필드 구조의 dict로"""
     rule = RULES[proto]
     alert = {
@@ -95,7 +103,8 @@ def build_alert(now, proto, src, dst, targets, window):
         alert["dest_ip"] = dst
     alert.update({
         "proto": proto,
-        "alert": {k: rule[k] for k in ("signature_id", "signature", "category")},
+        "alert": {"signature_id": rule["sid"][speed], "signature": signature(proto, speed),
+                  "category": rule["category"]},
         "scan": {"window": window, f"{rule['target'][:-1]}_count": len(targets),
                  rule["target"]: sort_targets(targets)},
     })
@@ -129,9 +138,13 @@ def main():
     parser.add_argument("-f", "--filter", default=DEFAULT_FILTER,
                         help="BPF 캡처 필터 (기본: TCP SYN + UDP + ARP)")
     parser.add_argument("-w", "--window", type=positive_float, default=10.0,
-                        help="탐지 시간 창, 초 (기본: %(default)s)")
+                        help="빠른 스캔 시간 창, 초 (기본: %(default)s)")
     parser.add_argument("-T", "--threshold", type=positive_int, default=15,
-                        help="시간 창 안의 서로 다른 대상(포트·IP) 수 기준 (기본: %(default)s)")
+                        help="빠른 스캔: 창 안의 서로 다른 대상(포트·IP) 수 기준 (기본: %(default)s)")
+    parser.add_argument("--slow-window", type=positive_float, default=60.0,
+                        help="저속 스캔 시간 창, 초 (기본: %(default)s)")
+    parser.add_argument("--slow-threshold", type=positive_int, default=20,
+                        help="저속 스캔: 창 안의 서로 다른 대상 수 기준 (기본: %(default)s)")
     parser.add_argument("-l", "--log",
                         help="경보를 JSON Lines로 덧붙여 기록할 파일")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -146,8 +159,22 @@ def main():
         except OSError as e:
             parser.error(f"로그 파일을 열 수 없습니다: {e}")
 
-    # 규칙마다 따로 셈: TCP 22와 UDP 22는 다른 포트, ARP는 포트가 아니라 IP를 셈
-    detectors = {proto: ScanDetector(args.window, args.threshold) for proto in RULES}
+    windows = {"fast": (args.window, args.threshold),
+               "slow": (args.slow_window, args.slow_threshold)}
+    # 규칙 × 속도마다 따로 셈: TCP 22와 UDP 22는 다른 포트, ARP는 포트가 아니라 IP를 셈
+    detectors = {(proto, speed): ScanDetector(*windows[speed])
+                 for proto in RULES for speed in SPEEDS}
+
+    def report(now, proto, speed, src, dst, targets):
+        window = windows[speed][0]
+        listed = sort_targets(targets)
+        sample = ", ".join(map(str, listed[:10])) + (", ..." if len(listed) > 10 else "")
+        unit = "포트" if RULES[proto]["target"] == "ports" else "IP"
+        print(f"[!] {fmt_time(now)} {signature(proto, speed)}: {src} → "
+              f"{window:g}초 안에 {unit} {len(targets)}개 ({sample})")
+        if log_file:
+            alert = build_alert(now, proto, speed, src, dst, targets, window)
+            log_file.write(json.dumps(alert, ensure_ascii=False) + "\n")
 
     def handle(pkt):
         result = classify(pkt)
@@ -158,19 +185,19 @@ def main():
         if args.verbose:
             print(f"{fmt_time(now)} {desc}")
 
-        targets = detectors[proto].check(src, target, now)
-        if not targets:
-            return
-        listed = sort_targets(targets)
-        sample = ", ".join(map(str, listed[:10])) + (", ..." if len(listed) > 10 else "")
-        unit = "포트" if RULES[proto]["target"] == "ports" else "IP"
-        print(f"[!] {fmt_time(now)} {RULES[proto]['signature']}: {src} → "
-              f"{args.window:g}초 안에 {unit} {len(targets)}개 ({sample})")
-        if log_file:
-            alert = build_alert(now, proto, src, dst, targets, args.window)
-            log_file.write(json.dumps(alert, ensure_ascii=False) + "\n")
+        for speed in SPEEDS:
+            targets = detectors[proto, speed].check(src, target, now)
+            if not targets:
+                continue
+            if speed == "slow":
+                # 같은 출발지가 긴 창 안에 빠른 스캔 경보를 받았다면 같은 공격 → 생략
+                last_fast = detectors[proto, "fast"].alerted.get(src, float("-inf"))
+                if now - last_fast < args.slow_window:
+                    continue
+            report(now, proto, speed, src, dst, targets)
 
-    print(f"[*] {args.iface} 감시 시작 (창 {args.window:g}초, 기준 {args.threshold}개"
+    print(f"[*] {args.iface} 감시 시작 (빠른 스캔 {args.window:g}초/{args.threshold}개, "
+          f"저속 스캔 {args.slow_window:g}초/{args.slow_threshold}개"
           f"{', 로그 ' + args.log if args.log else ''}), Ctrl+C로 종료")
     try:
         sniff(iface=args.iface, filter=args.filter, store=False, prn=handle)
